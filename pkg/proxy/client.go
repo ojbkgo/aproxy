@@ -18,6 +18,14 @@ func (c *ClientManager) Dial(ctx context.Context, addr string) error {
 
 }
 
+func (c *ClientManager) DialTLS(ctx context.Context, addr string) error {
+
+}
+
+func (c *ClientManager) register() {
+
+}
+
 func (c *ClientManager) waitConnection(ctx context.Context, conn net.Conn) error {
 
 }

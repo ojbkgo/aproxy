@@ -25,7 +25,8 @@ type MessageRevConnect struct {
 }
 
 type MessageRevConnectAck struct {
-	OK bool
+	OK  bool
+	Msg string
 }
 
 func readMessage(reader io.Reader) (*Message, error) {

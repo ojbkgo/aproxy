@@ -3,6 +3,7 @@ package proxy
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 )
 
@@ -14,6 +15,8 @@ const (
 	MessageTypeRegisterAck
 	MessageTypeRevConnect
 	MessageTypeRevConnectAck
+	MessageTypeRegisterDataChannel
+	MessageTypeRegisterDataChannelAck
 )
 
 const (
@@ -52,13 +55,16 @@ func (m *Message) Read(reader io.Reader) (int, error) {
 	}
 
 	m.typ = binary.BigEndian.Uint32(header[1:5])
-	m.size = binary.BigEndian.Uint32(header[5:])
+	m.size = binary.BigEndian.Uint32(header[5:]) - SizeHeader
+
+	fmt.Println(m.typ, m.size)
 
 	m.data = make([]byte, m.size)
 	size, err = reader.Read(m.data)
 	if err != nil {
 		return 0, err
 	}
+	fmt.Println(len(m.data), size)
 	if size != int(m.size) {
 		return 0, ErrBadConnection
 	}

@@ -10,6 +10,10 @@ type MessageDataChannelRegister struct {
 	ConnID  uint64
 }
 
+type MessageDataChannelRegisterAck struct {
+	OK bool
+}
+
 type MessageRegister struct {
 	Port uint
 }

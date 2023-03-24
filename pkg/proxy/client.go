@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 )
@@ -17,16 +18,18 @@ func NewClientManager(port uint) *ClientManager {
 }
 
 type ClientManager struct {
-	Port      uint
-	proxyID   uint64
-	ctl       net.Conn
-	peers     map[uint64]*clientPeer
-	mu        sync.Mutex
-	localAddr string
+	Port       uint
+	RemoteAddr string
+	RemotePort uint
+	proxyID    uint64
+	ctl        net.Conn
+	peers      map[uint64]*clientPeer
+	mu         sync.Mutex
+	localAddr  string
 }
 
-func (c *ClientManager) Dial(ctx context.Context, addr string) error {
-	conn, err := net.Dial("tcp", addr)
+func (c *ClientManager) Dial(ctx context.Context) error {
+	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", c.RemoteAddr, c.RemotePort))
 	if err != nil {
 		return err
 	}
@@ -58,6 +61,12 @@ func (c *ClientManager) Dial(ctx context.Context, addr string) error {
 	return nil
 }
 
+func (c *ClientManager) runTrans(ctx context.Context, connID uint64) {
+	if p, ok := c.peers[connID]; ok {
+		p.startTransfer()
+	}
+}
+
 func (c *ClientManager) DialTLS(ctx context.Context, addr string) error {
 	return nil
 }
@@ -79,11 +88,41 @@ func (c *ClientManager) connectLocal(ctx context.Context, connID uint64, localAd
 }
 
 func (c *ClientManager) registerDataChannel(ctx context.Context, proxyID, connID uint64) error {
+	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", c.RemoteAddr, c.RemotePort+1))
+	if err != nil {
+		return err
+	}
 
+	_, err = createMessage(MessageTypeRegister, MessageDataChannelRegister{
+		ProxyID: proxyID,
+		ConnID:  connID,
+	}).Write(conn)
+
+	if err != nil {
+		return err
+	}
+
+	rawMsg, err := readMessage(conn)
+	if err != nil {
+		return err
+	}
+
+	var ack *MessageDataChannelRegisterAck
+	if v, ok := assertMessage(rawMsg).(*MessageDataChannelRegisterAck); !ok {
+		return ErrBadConnection
+	} else {
+		ack = v
+	}
+
+	if ack.OK {
+		c.peers[connID].a = conn
+	}
+
+	return nil
 }
 
 // todo connID 由服务端产生， 单边重启的时候，这个id值会不会重复
-func (c *ClientManager) waitConnection(ctx context.Context) error {
+func (c *ClientManager) WaitConnection(ctx context.Context) error {
 
 	for {
 		rawMsg, err := readMessage(c.ctl)
@@ -111,7 +150,14 @@ func (c *ClientManager) waitConnection(ctx context.Context) error {
 			continue
 		}
 
-		c.registerDataChannel(ctx, revMsg.ProxyID, revMsg.ConnID)
+		err = c.registerDataChannel(ctx, revMsg.ProxyID, revMsg.ConnID)
+		if err != nil {
+			// todo ack false
+			// todo remove from peers
+			continue
+		}
+
+		c.runTrans(ctx, revMsg.ConnID)
 
 	}
 
@@ -125,5 +171,26 @@ type clientPeer struct {
 }
 
 func (p *clientPeer) startTransfer() {
+	go func() {
+		for {
+			n, err := io.Copy(p.a, p.b)
+			if err != nil {
+				fmt.Println(err)
+			}
 
+			fmt.Printf("from a to b: %d", n)
+		}
+	}()
+
+	go func() {
+		for {
+			n, err := io.Copy(p.b, p.a)
+
+			if err != nil {
+				fmt.Println(err)
+			}
+
+			fmt.Printf("from b to a: %d", n)
+		}
+	}()
 }

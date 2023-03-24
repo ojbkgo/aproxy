@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 )
@@ -55,7 +56,7 @@ func (m *Manager) Run(ctx context.Context, addr string) error {
 			fmt.Println(err.Error())
 			continue
 		}
-
+		fmt.Println("register...")
 		err = m.Register(conn)
 		if err != nil {
 			fmt.Println(err.Error())
@@ -100,16 +101,38 @@ func (m *Manager) RunDataChannel(ctx context.Context, addr string) error {
 			continue
 		}
 
-		m.StartTransfer(ctx, dcRegisterMsg.ProxyID, dcRegisterMsg.ConnID)
+		m.startTransfer(ctx, dcRegisterMsg.ProxyID, dcRegisterMsg.ConnID)
 	}
 }
 
-func (m *Manager) StartTransfer(ctx context.Context, proxyID, connID uint64) {
+func (m *Manager) startTransfer(ctx context.Context, proxyID, connID uint64) {
+	p := m.backends[proxyID].peers[connID]
+	go func() {
+		for {
+			n, err := io.Copy(p.a, p.b)
+			if err != nil {
+				fmt.Println(err)
+			}
 
+			fmt.Printf("from a to b: %d", n)
+		}
+	}()
+
+	go func() {
+		for {
+			n, err := io.Copy(p.b, p.a)
+
+			if err != nil {
+				fmt.Println(err)
+			}
+
+			fmt.Printf("from b to a: %d", n)
+		}
+	}()
 }
 
 func (m *Manager) Register(conn net.Conn) error {
-
+	fmt.Println("read message")
 	rawMsg, err := readMessage(conn)
 	if err != nil {
 		return err
@@ -131,6 +154,8 @@ func (m *Manager) Register(conn net.Conn) error {
 		port:  regMsg.Port,
 		peers: make(map[uint64]*peer),
 	}
+
+	fmt.Println("register...", regMsg.Port)
 
 	err = m.backends[proxyID].waitConnection(context.Background())
 	if err != nil {

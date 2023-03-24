@@ -55,6 +55,10 @@ func assertMessage(m *Message) interface{} {
 		o = &MessageRevConnect{}
 	case MessageTypeRevConnectAck:
 		o = &MessageRevConnectAck{}
+	case MessageTypeRegisterDataChannel:
+		o = &MessageDataChannelRegister{}
+	case MessageTypeRegisterDataChannelAck:
+		o = &MessageDataChannelRegisterAck{}
 	}
 
 	_ = json.Unmarshal(m.Data(), o)

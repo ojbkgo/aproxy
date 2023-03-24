@@ -90,6 +90,7 @@ func (m *Manager) RunDataChannel(ctx context.Context, addr string) error {
 
 		var dcRegisterMsg *MessageDataChannelRegister
 		if v, ok := assertMessage(msg).(*MessageDataChannelRegister); !ok {
+			fmt.Println("assertMessage MessageDataChannelRegister not exists")
 			return ErrBadConnection
 		} else {
 			dcRegisterMsg = v
@@ -140,6 +141,7 @@ func (m *Manager) Register(conn net.Conn) error {
 
 	var regMsg *MessageRegister
 	if v, ok := assertMessage(rawMsg).(*MessageRegister); !ok {
+		fmt.Println("assertMessage MessageRegister not exists")
 		return ErrBadConnection
 	} else {
 		regMsg = v
@@ -155,7 +157,7 @@ func (m *Manager) Register(conn net.Conn) error {
 		peers: make(map[uint64]*peer),
 	}
 
-	fmt.Println("register...", regMsg.Port)
+	fmt.Println("register...", regMsg.Port, proxyID)
 
 	err = m.backends[proxyID].waitConnection(context.Background())
 	if err != nil {
@@ -176,10 +178,12 @@ func (m *Manager) Register(conn net.Conn) error {
 
 func (m *Manager) Connect(ctx context.Context, proxyID, connID uint64, conn net.Conn) error {
 	if _, ok := m.backends[proxyID]; !ok {
+		fmt.Println("backend not exists:", proxyID)
 		return ErrBadConnection
 	}
 
 	if _, ok := m.backends[proxyID].peers[connID]; !ok {
+		fmt.Println("backend peers not exists:", proxyID, connID)
 		return ErrBadConnection
 	}
 
@@ -214,19 +218,21 @@ func (b *backend) waitConnection(ctx context.Context) error {
 	}
 
 	// go func
-	for {
-		conn, err := lsn.Accept()
-		if err != nil {
-			fmt.Println(err.Error())
-			continue
-		}
+	go func() {
+		for {
+			conn, err := lsn.Accept()
+			if err != nil {
+				fmt.Println(err.Error())
+				continue
+			}
 
-		err = b.reverseConnect(ctx, conn)
-		if err != nil {
-			fmt.Println(err.Error())
-			break
+			err = b.reverseConnect(ctx, conn)
+			if err != nil {
+				fmt.Println(err.Error())
+				break
+			}
 		}
-	}
+	}()
 
 	return nil
 }
@@ -237,7 +243,7 @@ func (b *backend) reverseConnect(ctx context.Context, conn net.Conn) error {
 	_, err := createMessage(MessageTypeRevConnect, &MessageRevConnect{
 		ProxyID: b.id,
 		ConnID:  connID,
-		Address: fmt.Sprintf(":%d", b.port),
+		Address: fmt.Sprintf(":%d", b.port+1),
 	}).Write(b.ctl)
 
 	if err != nil {
@@ -252,11 +258,13 @@ func (b *backend) reverseConnect(ctx context.Context, conn net.Conn) error {
 	// read ack
 	msg, err := readMessage(b.ctl)
 	if err != nil {
+		fmt.Println("reverseConnect readMessage error:", err.Error())
 		return err
 	}
 
 	var ackMsg *MessageRevConnectAck
 	if v, ok := assertMessage(msg).(*MessageRevConnectAck); !ok {
+		fmt.Println("assertMessage MessageRevConnectAck not exists")
 		return ErrBadConnection
 	} else {
 		ackMsg = v

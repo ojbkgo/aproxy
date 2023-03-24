@@ -50,6 +50,7 @@ func (c *ClientManager) Dial(ctx context.Context) error {
 
 	var ack *MessageRegisterAck
 	if v, ok := assertMessage(rawMsg).(*MessageRegisterAck); !ok {
+		fmt.Println("assertMessage MessageRegisterAck not ok")
 		return ErrBadConnection
 	} else {
 		ack = v
@@ -93,7 +94,7 @@ func (c *ClientManager) registerDataChannel(ctx context.Context, proxyID, connID
 		return err
 	}
 
-	_, err = createMessage(MessageTypeRegister, MessageDataChannelRegister{
+	_, err = createMessage(MessageTypeRegisterDataChannel, MessageDataChannelRegister{
 		ProxyID: proxyID,
 		ConnID:  connID,
 	}).Write(conn)
@@ -109,6 +110,7 @@ func (c *ClientManager) registerDataChannel(ctx context.Context, proxyID, connID
 
 	var ack *MessageDataChannelRegisterAck
 	if v, ok := assertMessage(rawMsg).(*MessageDataChannelRegisterAck); !ok {
+		fmt.Println("assertMessage MessageDataChannelRegisterAck not ok")
 		return ErrBadConnection
 	} else {
 		ack = v

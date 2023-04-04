@@ -3,9 +3,10 @@ package proxy
 import (
 	"context"
 	"fmt"
-	"io"
 	"net"
 	"sync"
+
+	"github.com/ojbkgo/aproxy/pkg/utils"
 )
 
 var (
@@ -96,40 +97,26 @@ func (m *Manager) RunDataChannel(ctx context.Context, addr string) error {
 			dcRegisterMsg = v
 		}
 
+		fmt.Println("receive data channel connection:", dcRegisterMsg.ProxyID, dcRegisterMsg.ConnID)
+
 		err = m.Connect(ctx, dcRegisterMsg.ProxyID, dcRegisterMsg.ConnID, conn)
 		if err != nil {
 			fmt.Println(err.Error())
 			continue
 		}
 
+		_, err = createMessage(MessageTypeRegisterDataChannelAck, &MessageDataChannelRegisterAck{
+			OK: true,
+		}).Write(conn)
+
+		fmt.Println("success send ack, start server side transfer...")
 		m.startTransfer(ctx, dcRegisterMsg.ProxyID, dcRegisterMsg.ConnID)
 	}
 }
 
 func (m *Manager) startTransfer(ctx context.Context, proxyID, connID uint64) {
 	p := m.backends[proxyID].peers[connID]
-	go func() {
-		for {
-			n, err := io.Copy(p.a, p.b)
-			if err != nil {
-				fmt.Println(err)
-			}
-
-			fmt.Printf("from a to b: %d", n)
-		}
-	}()
-
-	go func() {
-		for {
-			n, err := io.Copy(p.b, p.a)
-
-			if err != nil {
-				fmt.Println(err)
-			}
-
-			fmt.Printf("from b to a: %d", n)
-		}
-	}()
+	utils.ForwardData(p.a, p.b)
 }
 
 func (m *Manager) Register(conn net.Conn) error {

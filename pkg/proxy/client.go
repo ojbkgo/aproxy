@@ -3,9 +3,10 @@ package proxy
 import (
 	"context"
 	"fmt"
-	"io"
 	"net"
 	"sync"
+
+	"github.com/ojbkgo/aproxy/pkg/utils"
 )
 
 func NewClientManager(port uint) *ClientManager {
@@ -64,7 +65,10 @@ func (c *ClientManager) Dial(ctx context.Context) error {
 
 func (c *ClientManager) runTrans(ctx context.Context, connID uint64) {
 	if p, ok := c.peers[connID]; ok {
+		fmt.Println("start transfer ", c.proxyID, connID)
 		p.startTransfer()
+	} else {
+		fmt.Println("peers not ready ", connID)
 	}
 }
 
@@ -103,6 +107,8 @@ func (c *ClientManager) registerDataChannel(ctx context.Context, proxyID, connID
 		return err
 	}
 
+	fmt.Println("register data channel success")
+
 	rawMsg, err := readMessage(conn)
 	if err != nil {
 		return err
@@ -115,6 +121,8 @@ func (c *ClientManager) registerDataChannel(ctx context.Context, proxyID, connID
 	} else {
 		ack = v
 	}
+
+	fmt.Println("get ack of register data channel success")
 
 	if ack.OK {
 		c.peers[connID].a = conn
@@ -140,6 +148,8 @@ func (c *ClientManager) WaitConnection(ctx context.Context) error {
 			revMsg = v
 		}
 
+		fmt.Println("receive connection command:", revMsg.Address, revMsg.ConnID, revMsg.ProxyID)
+
 		err = c.connectLocal(ctx, revMsg.ConnID, revMsg.Address)
 		if err != nil {
 			fmt.Println(err.Error())
@@ -152,12 +162,27 @@ func (c *ClientManager) WaitConnection(ctx context.Context) error {
 			continue
 		}
 
-		err = c.registerDataChannel(ctx, revMsg.ProxyID, revMsg.ConnID)
+		fmt.Println("connect local success:", revMsg.Address)
+
+		_, err = createMessage(MessageTypeRevConnectAck, &MessageRevConnectAck{
+			OK:  true,
+			Msg: "OK",
+		}).Write(c.ctl)
 		if err != nil {
+			fmt.Println("bad connection:", "write ack error", err.Error())
+			continue
+		}
+
+		err = c.registerDataChannel(ctx, revMsg.ProxyID, revMsg.ConnID)
+
+		if err != nil {
+			fmt.Println("registerDataChannel error", err.Error())
 			// todo ack false
 			// todo remove from peers
 			continue
 		}
+
+		fmt.Println("registerDataChannel success")
 
 		c.runTrans(ctx, revMsg.ConnID)
 
@@ -173,26 +198,5 @@ type clientPeer struct {
 }
 
 func (p *clientPeer) startTransfer() {
-	go func() {
-		for {
-			n, err := io.Copy(p.a, p.b)
-			if err != nil {
-				fmt.Println(err)
-			}
-
-			fmt.Printf("from a to b: %d", n)
-		}
-	}()
-
-	go func() {
-		for {
-			n, err := io.Copy(p.b, p.a)
-
-			if err != nil {
-				fmt.Println(err)
-			}
-
-			fmt.Printf("from b to a: %d", n)
-		}
-	}()
+	utils.ForwardData(p.a, p.b)
 }

@@ -16,16 +16,18 @@ type MessageDataChannelRegisterAck struct {
 
 type MessageRegister struct {
 	Port uint
+
+	App *AppInfo
 }
 
 type MessageRegisterAck struct {
-	ID uint64
+	ID  uint64
+	Msg string
 }
 
 type MessageRevConnect struct {
 	ProxyID uint64
 	ConnID  uint64
-	Address string
 }
 
 type MessageRevConnectAck struct {

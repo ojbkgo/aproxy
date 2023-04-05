@@ -2,41 +2,61 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log"
 	"net"
 	"sync"
 
 	"github.com/ojbkgo/aproxy/pkg/utils"
 )
 
-func NewClientManager(port uint) *ClientManager {
-	m := &ClientManager{
-		Port:  port,
+func NewClient() *Client {
+	m := &Client{
 		peers: make(map[uint64]*clientPeer),
 	}
 
 	return m
 }
 
-type ClientManager struct {
-	Port       uint
-	RemoteAddr string
-	RemotePort uint
-	proxyID    uint64
-	ctl        net.Conn
-	peers      map[uint64]*clientPeer
-	mu         sync.Mutex
-	localAddr  string
+type AppInfo struct {
+	Name      string // consul service name
+	ServiceID string // consul service id
+	Domain    string // nginx domain
+	Host      string // host tags
 }
 
-func (c *ClientManager) Dial(ctx context.Context) error {
-	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", c.RemoteAddr, c.RemotePort))
+type Client struct {
+	proxyID              uint64
+	ctl                  net.Conn
+	peers                map[uint64]*clientPeer
+	mu                   sync.Mutex
+	localAddr            string
+	serverAddr           string
+	portA                int64
+	portB                int64
+	Info                 *AppInfo
+	ReceiveFn            ClientHookReceiveConnection
+	ResetFn              ClientHookConnectionReset
+	BeforeConnectLocalFn ClientHookBeforeConnectLocal
+	AfterConnectLocalFn  ClientHookAfterConnectLocal
+}
+
+func (c *Client) Register(ctx context.Context, addr string, exposePort uint) error {
+	ip, ports := utils.ParseAddr(addr)
+	c.serverAddr = ip
+	c.portA = ports[0]
+	c.portB = ports[1]
+
+	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", ip, c.portA))
 	if err != nil {
 		return err
 	}
 
 	msg := createMessage(MessageTypeRegister, &MessageRegister{
-		Port: c.Port,
+		Port: exposePort,
+
+		App: c.Info,
 	})
 
 	_, err = msg.Write(conn)
@@ -51,10 +71,14 @@ func (c *ClientManager) Dial(ctx context.Context) error {
 
 	var ack *MessageRegisterAck
 	if v, ok := assertMessage(rawMsg).(*MessageRegisterAck); !ok {
-		fmt.Println("assertMessage MessageRegisterAck not ok")
+		log.Println("assertMessage MessageRegisterAck not ok")
 		return ErrBadConnection
 	} else {
 		ack = v
+	}
+
+	if ack.ID == 0 {
+		return errors.New(ack.Msg)
 	}
 
 	c.proxyID = ack.ID
@@ -63,20 +87,22 @@ func (c *ClientManager) Dial(ctx context.Context) error {
 	return nil
 }
 
-func (c *ClientManager) runTrans(ctx context.Context, connID uint64) {
+func (c *Client) runTrans(ctx context.Context, connID uint64) {
 	if p, ok := c.peers[connID]; ok {
-		fmt.Println("start transfer ", c.proxyID, connID)
 		p.startTransfer()
-	} else {
-		fmt.Println("peers not ready ", connID)
+
+		go func() {
+			<-p.closed
+			if c.ResetFn != nil {
+				c.ResetFn(c.proxyID, connID)
+			}
+			log.Println("connection closed: ", connID)
+			delete(c.peers, connID)
+		}()
 	}
 }
 
-func (c *ClientManager) DialTLS(ctx context.Context, addr string) error {
-	return nil
-}
-
-func (c *ClientManager) connectLocal(ctx context.Context, connID uint64, localAddr string) error {
+func (c *Client) connectLocal(ctx context.Context, connID uint64, localAddr string) error {
 	if _, ok := c.peers[connID]; !ok {
 		c.peers[connID] = &clientPeer{
 			connID: connID,
@@ -85,6 +111,15 @@ func (c *ClientManager) connectLocal(ctx context.Context, connID uint64, localAd
 
 	conn, err := net.Dial("tcp", localAddr)
 	if err != nil {
+		if c.peers[connID].a != nil {
+			c.peers[connID].a.Close()
+		}
+
+		if c.peers[connID].b != nil {
+			c.peers[connID].b.Close()
+		}
+
+		delete(c.peers, connID)
 		return err
 	}
 
@@ -92,8 +127,9 @@ func (c *ClientManager) connectLocal(ctx context.Context, connID uint64, localAd
 	return nil
 }
 
-func (c *ClientManager) registerDataChannel(ctx context.Context, proxyID, connID uint64) error {
-	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", c.RemoteAddr, c.RemotePort+1))
+func (c *Client) registerDataChannel(ctx context.Context, proxyID, connID uint64) error {
+	fmt.Printf("%s:%d", c.serverAddr, c.portB)
+	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", c.serverAddr, c.portB))
 	if err != nil {
 		return err
 	}
@@ -107,7 +143,7 @@ func (c *ClientManager) registerDataChannel(ctx context.Context, proxyID, connID
 		return err
 	}
 
-	fmt.Println("register data channel success")
+	log.Println("register data channel success")
 
 	rawMsg, err := readMessage(conn)
 	if err != nil {
@@ -116,13 +152,18 @@ func (c *ClientManager) registerDataChannel(ctx context.Context, proxyID, connID
 
 	var ack *MessageDataChannelRegisterAck
 	if v, ok := assertMessage(rawMsg).(*MessageDataChannelRegisterAck); !ok {
-		fmt.Println("assertMessage MessageDataChannelRegisterAck not ok")
+		log.Println("assertMessage MessageDataChannelRegisterAck not ok")
 		return ErrBadConnection
 	} else {
 		ack = v
 	}
 
-	fmt.Println("get ack of register data channel success")
+	log.Println("get ack of register data channel success")
+
+	if _, ok := c.peers[connID]; !ok {
+		conn.Close()
+		return nil
+	}
 
 	if ack.OK {
 		c.peers[connID].a = conn
@@ -131,72 +172,81 @@ func (c *ClientManager) registerDataChannel(ctx context.Context, proxyID, connID
 	return nil
 }
 
-// todo connID 由服务端产生， 单边重启的时候，这个id值会不会重复
-func (c *ClientManager) WaitConnection(ctx context.Context) error {
-
+func (c *Client) ProxyTo(ctx context.Context, addr string) error {
 	for {
 		rawMsg, err := readMessage(c.ctl)
 		if err != nil {
-			fmt.Println(err.Error())
-			continue
+			log.Printf("read rev connection error: %s\n", err.Error())
+			return nil
 		}
 
 		var revMsg *MessageRevConnect
 		if v, ok := assertMessage(rawMsg).(*MessageRevConnect); !ok {
-			fmt.Println("bad connection")
+			log.Println("bad connection")
 		} else {
 			revMsg = v
 		}
 
-		fmt.Println("receive connection command:", revMsg.Address, revMsg.ConnID, revMsg.ProxyID)
-
-		err = c.connectLocal(ctx, revMsg.ConnID, revMsg.Address)
-		if err != nil {
-			fmt.Println(err.Error())
-
-			_, _ = createMessage(MessageTypeRevConnectAck, &MessageRevConnectAck{
-				OK:  false,
-				Msg: err.Error(),
-			}).Write(c.ctl)
-
-			continue
+		log.Println("receive connection command:", addr, revMsg.ConnID, revMsg.ProxyID)
+		if c.ReceiveFn != nil {
+			c.ReceiveFn(c.proxyID, revMsg.ConnID)
 		}
 
-		fmt.Println("connect local success:", revMsg.Address)
-
-		_, err = createMessage(MessageTypeRevConnectAck, &MessageRevConnectAck{
-			OK:  true,
-			Msg: "OK",
-		}).Write(c.ctl)
+		err = c.connectLocal(ctx, revMsg.ConnID, addr)
 		if err != nil {
-			fmt.Println("bad connection:", "write ack error", err.Error())
-			continue
+			log.Printf("connect local error: %s\n", err.Error())
+
+			//_, _ = createMessage(MessageTypeRevConnectAck, &MessageRevConnectAck{
+			//	OK:  false,
+			//	Msg: err.Error(),
+			//}).Write(c.ctl)
 		}
+
+		//log.Println("connect local success:", addr)
+		//_, err = createMessage(MessageTypeRevConnectAck, &MessageRevConnectAck{
+		//	OK:  true,
+		//	Msg: "OK",
+		//}).Write(c.ctl)
+		//if err != nil {
+		//	log.Println("connect local success but write ack error: ", err.Error())
+		//	continue
+		//}
 
 		err = c.registerDataChannel(ctx, revMsg.ProxyID, revMsg.ConnID)
-
 		if err != nil {
-			fmt.Println("registerDataChannel error", err.Error())
-			// todo ack false
-			// todo remove from peers
+			log.Println("register data channel error:", err.Error())
 			continue
 		}
 
-		fmt.Println("registerDataChannel success")
+		log.Println("registerDataChannel success")
 
 		c.runTrans(ctx, revMsg.ConnID)
-
 	}
 
 	return nil
+}
+
+func (c *Client) Quit() {
+	c.ctl.Close()
+
+	for _, it := range c.peers {
+		if it.a != nil {
+			it.a.Close()
+		}
+
+		if it.b == nil {
+			it.b.Close()
+		}
+	}
 }
 
 type clientPeer struct {
 	connID uint64
 	a      net.Conn
 	b      net.Conn
+	closed chan struct{}
 }
 
 func (p *clientPeer) startTransfer() {
-	utils.ForwardData(p.a, p.b)
+	p.closed = utils.ForwardData(p.a, p.b)
 }

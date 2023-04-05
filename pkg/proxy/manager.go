@@ -3,8 +3,11 @@ package proxy
 import (
 	"context"
 	"fmt"
+	"io"
+	"log"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/ojbkgo/aproxy/pkg/utils"
 )
@@ -24,26 +27,33 @@ func nextConnID() uint64 {
 	return maxConnID
 }
 
-type Manager struct {
-	proxyID  uint64
-	connID   uint64
-	sig      chan struct{}
-	backends map[uint64]*backend // port -> backend
-	mu       sync.Mutex
+type Server struct {
+	sig                 chan struct{}
+	backends            map[uint64]*backend // port -> backend
+	mu                  sync.Mutex
+	ctlListener         net.Listener
+	dataChannelListener net.Listener
+	wg                  sync.WaitGroup
 	//connID2Backend  map[uint64]int
 }
 
-func NewManager() *Manager {
-	return &Manager{
+func NewServer() *Server {
+	return &Server{
 		sig:      make(chan struct{}),
 		backends: make(map[uint64]*backend),
 		//connID2Backend:  make(map[uint64]int),
 	}
 }
 
-func (m *Manager) Run(ctx context.Context, addr string) error {
+func (m *Server) Wait() {
+	time.Sleep(time.Second * 3)
+	m.wg.Wait()
+}
+
+func (m *Server) Run(ctx context.Context, addr string) error {
+	m.wg.Add(1)
 	defer func() {
-		m.Stop()
+		m.wg.Done()
 	}()
 
 	lsn, err := net.Listen("tcp", addr)
@@ -51,57 +61,65 @@ func (m *Manager) Run(ctx context.Context, addr string) error {
 		return err
 	}
 
+	m.ctlListener = lsn
+
 	for {
 		conn, err := lsn.Accept()
 		if err != nil {
-			fmt.Println(err.Error())
-			continue
+			log.Println("wait for control channel connection over:", err.Error())
+			return nil
 		}
-		fmt.Println("register...")
+
 		err = m.Register(conn)
 		if err != nil {
-			fmt.Println(err.Error())
+			log.Println("register proxy error:", err.Error())
 			continue
 		}
 	}
 }
 
-func (m *Manager) RunDataChannel(ctx context.Context, addr string) error {
+func (m *Server) RunDataChannel(ctx context.Context, addr string) error {
+	m.wg.Add(1)
 	defer func() {
-		m.Stop()
+		m.wg.Done()
 	}()
 
+	fmt.Println(addr)
 	lsn, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
 	}
 
+	m.dataChannelListener = lsn
+	fmt.Println("start listen...")
 	for {
 		conn, err := lsn.Accept()
 		if err != nil {
-			fmt.Println(err.Error())
-			continue
+			log.Println("wait data channel connection over: ", err.Error())
+			return err
 		}
 
+		fmt.Println("start")
 		msg, err := readMessage(conn)
+		fmt.Println("end")
 		if err != nil {
-			fmt.Println(err.Error())
+			log.Println(err.Error())
 			return err
 		}
 
 		var dcRegisterMsg *MessageDataChannelRegister
 		if v, ok := assertMessage(msg).(*MessageDataChannelRegister); !ok {
-			fmt.Println("assertMessage MessageDataChannelRegister not exists")
+			log.Println("assertMessage MessageDataChannelRegister not exists")
 			return ErrBadConnection
 		} else {
 			dcRegisterMsg = v
 		}
 
-		fmt.Println("receive data channel connection:", dcRegisterMsg.ProxyID, dcRegisterMsg.ConnID)
+		log.Println("receive data channel connection:", dcRegisterMsg.ProxyID, dcRegisterMsg.ConnID)
 
 		err = m.Connect(ctx, dcRegisterMsg.ProxyID, dcRegisterMsg.ConnID, conn)
 		if err != nil {
-			fmt.Println(err.Error())
+			log.Println(err.Error())
 			continue
 		}
 
@@ -109,18 +127,64 @@ func (m *Manager) RunDataChannel(ctx context.Context, addr string) error {
 			OK: true,
 		}).Write(conn)
 
-		fmt.Println("success send ack, start server side transfer...")
+		log.Println("success send ack, start server side transfer...")
 		m.startTransfer(ctx, dcRegisterMsg.ProxyID, dcRegisterMsg.ConnID)
 	}
 }
 
-func (m *Manager) startTransfer(ctx context.Context, proxyID, connID uint64) {
-	p := m.backends[proxyID].peers[connID]
-	utils.ForwardData(p.a, p.b)
+func (m *Server) Stats() {
+	go func() {
+		tk := time.NewTicker(time.Second * 3)
+		for {
+			select {
+			case <-tk.C:
+				if len(m.backends) > 0 {
+					log.Printf("total backends: %d\n", len(m.backends))
+					for _, it := range m.backends {
+						log.Printf("backend: %s\t%s\tpeers: %d, proxyID: %d\n", it.App.Name, it.App.ServiceID, len(it.peers), it.id)
+						for _, it2 := range it.peers {
+							log.Printf("proxyID: %d\tpeer connID: %d\n", it.id, it2.connID)
+						}
+					}
+				}
+			case <-m.sig:
+				return
+			}
+		}
+	}()
 }
 
-func (m *Manager) Register(conn net.Conn) error {
-	fmt.Println("read message")
+func (m *Server) startTransfer(ctx context.Context, proxyID, connID uint64) {
+	p := m.backends[proxyID].peers[connID]
+	closed := utils.ForwardData(p.a, p.b)
+	go func() {
+		<-closed
+		if _, ok := m.backends[proxyID]; ok {
+			delete(m.backends[proxyID].peers, connID)
+		}
+	}()
+}
+
+func (m *Server) closeProxy(proxyID uint64) {
+	if _, ok := m.backends[proxyID]; !ok {
+		return
+	}
+
+	m.backends[proxyID].close()
+	delete(m.backends, proxyID)
+}
+
+func (m *Server) waitProxyClose(conn net.Conn, proxyId uint64) {
+	go func() {
+		buf := make([]byte, 1)
+		_, err := conn.Read(buf)
+		if err == io.EOF {
+			m.closeProxy(proxyId)
+		}
+	}()
+}
+
+func (m *Server) Register(conn net.Conn) error {
 	rawMsg, err := readMessage(conn)
 	if err != nil {
 		return err
@@ -128,7 +192,7 @@ func (m *Manager) Register(conn net.Conn) error {
 
 	var regMsg *MessageRegister
 	if v, ok := assertMessage(rawMsg).(*MessageRegister); !ok {
-		fmt.Println("assertMessage MessageRegister not exists")
+		log.Println("assertMessage MessageRegister not ok")
 		return ErrBadConnection
 	} else {
 		regMsg = v
@@ -144,11 +208,25 @@ func (m *Manager) Register(conn net.Conn) error {
 		peers: make(map[uint64]*peer),
 	}
 
-	fmt.Println("register...", regMsg.Port, proxyID)
+	log.Printf("proxy client [%d] registered, expose port %d\n", proxyID, regMsg.Port)
 
 	err = m.backends[proxyID].waitConnection(context.Background())
 	if err != nil {
-		fmt.Println(err.Error())
+		log.Printf("start server side proxy failed: %s, proxy id : %d\n", err.Error(), proxyID)
+
+		msg := createMessage(MessageTypeRegisterAck, &MessageRegisterAck{
+			ID:  0,
+			Msg: err.Error(),
+		})
+
+		_, err = msg.Write(conn)
+		if err != nil {
+			return err
+		}
+
+		m.closeProxy(proxyID)
+
+		return err
 	}
 
 	msg := createMessage(MessageTypeRegisterAck, &MessageRegisterAck{
@@ -160,17 +238,19 @@ func (m *Manager) Register(conn net.Conn) error {
 		return err
 	}
 
+	m.waitProxyClose(conn, proxyID)
+
 	return nil
 }
 
-func (m *Manager) Connect(ctx context.Context, proxyID, connID uint64, conn net.Conn) error {
+func (m *Server) Connect(ctx context.Context, proxyID, connID uint64, conn net.Conn) error {
 	if _, ok := m.backends[proxyID]; !ok {
-		fmt.Println("backend not exists:", proxyID)
+		log.Println("backend not exists:", proxyID)
 		return ErrBadConnection
 	}
 
 	if _, ok := m.backends[proxyID].peers[connID]; !ok {
-		fmt.Println("backend peers not exists:", proxyID, connID)
+		log.Println("backend peers not exists:", proxyID, connID)
 		return ErrBadConnection
 	}
 
@@ -180,15 +260,22 @@ func (m *Manager) Connect(ctx context.Context, proxyID, connID uint64, conn net.
 	return nil
 }
 
-func (m *Manager) Stop() {
+func (m *Server) Quit() {
+	m.ctlListener.Close()
+	m.dataChannelListener.Close()
 
+	for _, it := range m.backends {
+		it.close()
+	}
 }
 
 type backend struct {
-	id    uint64
-	port  uint // 控制管道端口
-	ctl   net.Conn
-	peers map[uint64]*peer
+	id       uint64
+	port     uint // 控制管道端口
+	ctl      net.Conn
+	listener net.Listener
+	peers    map[uint64]*peer
+	App      AppInfo
 }
 
 type peer struct {
@@ -198,25 +285,41 @@ type peer struct {
 	ready  bool
 }
 
+func (b *backend) close() {
+	b.listener.Close()
+	b.ctl.Close()
+
+	for _, it := range b.peers {
+		if it.a != nil {
+			it.a.Close()
+		}
+
+		if it.b != nil {
+			it.b.Close()
+		}
+	}
+}
+
 func (b *backend) waitConnection(ctx context.Context) error {
-	lsn, err := net.Listen("tcp", fmt.Sprintf(":%d", b.port))
+	lsn, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", b.port))
 	if err != nil {
 		return err
 	}
+	b.listener = lsn
 
 	// go func
 	go func() {
 		for {
 			conn, err := lsn.Accept()
 			if err != nil {
-				fmt.Println(err.Error())
-				continue
+				log.Println("waiting for connect over: ", err.Error())
+				return
 			}
 
 			err = b.reverseConnect(ctx, conn)
 			if err != nil {
-				fmt.Println(err.Error())
-				break
+				log.Println("reverse connect error: ", err.Error())
+				continue
 			}
 		}
 	}()
@@ -230,7 +333,6 @@ func (b *backend) reverseConnect(ctx context.Context, conn net.Conn) error {
 	_, err := createMessage(MessageTypeRevConnect, &MessageRevConnect{
 		ProxyID: b.id,
 		ConnID:  connID,
-		Address: fmt.Sprintf(":%d", b.port+1),
 	}).Write(b.ctl)
 
 	if err != nil {
@@ -243,23 +345,21 @@ func (b *backend) reverseConnect(ctx context.Context, conn net.Conn) error {
 	}
 
 	// read ack
-	msg, err := readMessage(b.ctl)
-	if err != nil {
-		fmt.Println("reverseConnect readMessage error:", err.Error())
-		return err
-	}
+	//msg, err := readMessage(b.ctl)
+	//if err != nil {
+	//	return err
+	//}
 
-	var ackMsg *MessageRevConnectAck
-	if v, ok := assertMessage(msg).(*MessageRevConnectAck); !ok {
-		fmt.Println("assertMessage MessageRevConnectAck not exists")
-		return ErrBadConnection
-	} else {
-		ackMsg = v
-	}
+	//var ackMsg *MessageRevConnectAck
+	//if v, ok := assertMessage(msg).(*MessageRevConnectAck); !ok {
+	//	return ErrBadConnection
+	//} else {
+	//	ackMsg = v
+	//}
 
-	if !ackMsg.OK {
-		// todo 清理消息
-	}
+	//if !ackMsg.OK {
+	//	// todo 清理消息
+	//}
 
 	return nil
 }

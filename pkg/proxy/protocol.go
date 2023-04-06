@@ -17,6 +17,7 @@ const (
 	MessageTypeRevConnectAck
 	MessageTypeRegisterDataChannel
 	MessageTypeRegisterDataChannelAck
+	MessageTypeHeartbeat
 )
 
 const (

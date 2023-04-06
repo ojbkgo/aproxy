@@ -239,8 +239,25 @@ func (m *Server) Register(conn net.Conn) error {
 	}
 
 	m.waitProxyClose(conn, proxyID)
+	m.keepalive(conn)
 
 	return nil
+}
+
+func (m *Server) keepalive(conn net.Conn) {
+	go func() {
+		tk := time.NewTicker(time.Second)
+
+		for {
+			select {
+			case <-tk.C:
+				_, err := createMessage(MessageTypeHeartbeat, &MessageHeartbeat{}).Write(conn)
+				if err != nil {
+					return
+				}
+			}
+		}
+	}()
 }
 
 func (m *Server) Connect(ctx context.Context, proxyID, connID uint64, conn net.Conn) error {

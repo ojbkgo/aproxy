@@ -25,6 +25,9 @@ type MessageRegisterAck struct {
 	Msg string
 }
 
+type MessageHeartbeat struct {
+}
+
 type MessageRevConnect struct {
 	ProxyID uint64
 	ConnID  uint64
@@ -61,6 +64,8 @@ func assertMessage(m *Message) interface{} {
 		o = &MessageDataChannelRegister{}
 	case MessageTypeRegisterDataChannelAck:
 		o = &MessageDataChannelRegisterAck{}
+	case MessageTypeHeartbeat:
+		o = &MessageHeartbeat{}
 	}
 
 	_ = json.Unmarshal(m.Data(), o)

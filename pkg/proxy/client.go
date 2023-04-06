@@ -40,6 +40,7 @@ type Client struct {
 	ResetFn              ClientHookConnectionReset
 	BeforeConnectLocalFn ClientHookBeforeConnectLocal
 	AfterConnectLocalFn  ClientHookAfterConnectLocal
+	restart              chan struct{}
 }
 
 func (c *Client) Register(ctx context.Context, addr string, exposePort uint) error {
@@ -88,6 +89,8 @@ func (c *Client) Register(ctx context.Context, addr string, exposePort uint) err
 }
 
 func (c *Client) runTrans(ctx context.Context, connID uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if p, ok := c.peers[connID]; ok {
 		p.startTransfer()
 
@@ -96,13 +99,16 @@ func (c *Client) runTrans(ctx context.Context, connID uint64) {
 			if c.ResetFn != nil {
 				c.ResetFn(c.proxyID, connID)
 			}
-			log.Println("connection closed: ", connID)
+			c.mu.Lock()
+			defer c.mu.Unlock()
 			delete(c.peers, connID)
 		}()
 	}
 }
 
 func (c *Client) connectLocal(ctx context.Context, connID uint64, localAddr string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if _, ok := c.peers[connID]; !ok {
 		c.peers[connID] = &clientPeer{
 			connID: connID,
@@ -118,7 +124,6 @@ func (c *Client) connectLocal(ctx context.Context, connID uint64, localAddr stri
 		if c.peers[connID].b != nil {
 			c.peers[connID].b.Close()
 		}
-
 		delete(c.peers, connID)
 		return err
 	}
@@ -128,7 +133,6 @@ func (c *Client) connectLocal(ctx context.Context, connID uint64, localAddr stri
 }
 
 func (c *Client) registerDataChannel(ctx context.Context, proxyID, connID uint64) error {
-	fmt.Printf("%s:%d", c.serverAddr, c.portB)
 	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", c.serverAddr, c.portB))
 	if err != nil {
 		return err
@@ -159,7 +163,8 @@ func (c *Client) registerDataChannel(ctx context.Context, proxyID, connID uint64
 	}
 
 	log.Println("get ack of register data channel success")
-
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if _, ok := c.peers[connID]; !ok {
 		conn.Close()
 		return nil
@@ -177,7 +182,13 @@ func (c *Client) ProxyTo(ctx context.Context, addr string) error {
 		rawMsg, err := readMessage(c.ctl)
 		if err != nil {
 			log.Printf("read rev connection error: %s\n", err.Error())
+			c.restart <- struct{}{}
 			return nil
+		}
+
+		if _, ok := assertMessage(rawMsg).(*MessageHeartbeat); ok {
+			fmt.Println("heart beat, skip")
+			continue
 		}
 
 		var revMsg *MessageRevConnect
@@ -227,6 +238,8 @@ func (c *Client) ProxyTo(ctx context.Context, addr string) error {
 }
 
 func (c *Client) Quit() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.ctl.Close()
 
 	for _, it := range c.peers {
